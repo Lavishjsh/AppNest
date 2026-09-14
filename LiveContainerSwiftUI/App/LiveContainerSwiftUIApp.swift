@@ -79,6 +79,13 @@ struct LiveContainerSwiftUIApp : SwiftUI.App {
             try fm.createDirectory(at: LCPath.tweakPath, withIntermediateDirectories: true)
             let tweakDirs = try fm.contentsOfDirectory(atPath: LCPath.tweakPath.path)
             for tweakDir in tweakDirs {
+                // .lc_shared_jbroot (DebImporter's cross-package resource mirror) is a
+                // real directory sitting at this same top level, not a tweak folder the
+                // user picked or created -- skip anything dotfile-prefixed here so it
+                // doesn't show up as a selectable tweak folder in the per-app picker.
+                if tweakDir.hasPrefix(".") {
+                    continue
+                }
                 let tweakDirUrl = LCPath.tweakPath.appendingPathComponent(tweakDir)
                 if !tweakDirUrl.hasDirectoryPath {
                     continue

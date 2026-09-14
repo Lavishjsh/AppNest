@@ -33,34 +33,16 @@ final class LCTweakMoveContext: ObservableObject {
     }
 }
 
-private struct LCPackageMetadata: Codable {
-    let packageID: String
-    let version: String
-    let architecture: String?
-    let name: String?
-    let depends: String?
-    let sourceFilename: String
-    let importedAt: String
-    let loadableArtifacts: [String]
-    let routesDetected: [String]
-    let needsSigning: Bool
-}
-
-private struct LCControlInfo {
-    let packageID: String
-    let version: String
-    let architecture: String?
-    let name: String?
-    let depends: String?
-}
-
 struct LCTweakItem : Hashable {
     let fileUrl: URL
     let isFolder: Bool
     let isFramework: Bool
     let isTweak: Bool
-    let isPackage: Bool
-    let needsSigning: Bool
+    // Marked by DebImporter (.lc_deb_tweak) so this folder -- which mirrors a single
+    // imported .deb's own directory structure -- is visually distinct from a plain
+    // folder the user created themselves, and so it's recognized as safe to overwrite
+    // on re-import of the same package and to clean up on delete.
+    let isDebImportedTweak: Bool
 
     var supportsDisableToggle: Bool {
         // TweakLoader.dylib is the injector itself — disabling it would be
@@ -112,6 +94,8 @@ struct LCTweakFolderView : View {
     
     @State private var errorShow = false
     @State private var errorInfo = ""
+    @State private var showUnsupportedScriptWarning = false
+    @State private var unsupportedScriptLines: [String] = []
     
     @StateObject private var newFolderInput = InputHelper()
     
@@ -198,14 +182,6 @@ struct LCTweakFolderView : View {
                                     } else {
                                         Label("lc.tweakView.disable".loc, systemImage: "nosign")
                                     }
-                                }
-                            }
-
-                            if tweakItem.isFolder && tweakItem.isPackage && tweakItem.needsSigning {
-                                Button {
-                                    Task { await signPackage(tweakItem: tweakItem) }
-                                } label: {
-                                    Label("lc.tweakView.signPackage".loc, systemImage: "signature")
                                 }
                             }
 
@@ -333,6 +309,12 @@ struct LCTweakFolderView : View {
         } message: {
             Text(errorInfo)
         }
+        .alert("lc.tweakView.debUnsupportedScriptTitle".loc, isPresented: $showUnsupportedScriptWarning) {
+            Button("lc.common.ok".loc, action: {
+            })
+        } message: {
+            Text("lc.tweakView.debUnsupportedScriptMsg %@".localizeWithFormat(unsupportedScriptLines.joined(separator: "\n")))
+        }
         .textFieldAlert(
             isPresented: $newFolderInput.show,
             title: "lc.common.enterNewFolderName".loc,
@@ -422,6 +404,9 @@ struct LCTweakFolderView : View {
         if tweakItem.isFramework {
             return "shippingbox.fill"
         }
+        if tweakItem.isDebImportedTweak {
+            return "archivebox.fill"
+        }
         if tweakItem.isFolder {
             return "folder.fill"
         }
@@ -457,6 +442,9 @@ struct LCTweakFolderView : View {
                 if tweakItem.supportsDisableToggle {
                     disabledTweaks.remove(tweakItem.fileUrl.lastPathComponent)
                 }
+                if tweakItem.isDebImportedTweak {
+                    DebImporter.removeTweak(named: tweakItem.fileUrl.lastPathComponent, from: baseUrl)
+                }
                 indexToRemove.append(i)
             }
             try persistDisabledTweaks()
@@ -488,6 +476,9 @@ struct LCTweakFolderView : View {
             if tweakItem.supportsDisableToggle {
                 disabledTweaks.remove(tweakItem.fileUrl.lastPathComponent)
                 try persistDisabledTweaks()
+            }
+            if tweakItem.isDebImportedTweak {
+                DebImporter.removeTweak(named: tweakItem.fileUrl.lastPathComponent, from: baseUrl)
             }
         } catch {
             errorShow = true
@@ -539,13 +530,15 @@ struct LCTweakFolderView : View {
             }
         }
         tweakItems.remove(at: indexToRename)
+        // Renaming a deb-imported folder is otherwise allowed, but its entries in
+        // .lc_deb_redirects.plist stay keyed to the old name and go stale -- the same
+        // limitation the upstream feature ships with, not something introduced here.
         let newTweakItem = LCTweakItem(
             fileUrl: newUrl,
             isFolder: tweakItem.isFolder,
             isFramework: tweakItem.isFramework,
             isTweak: tweakItem.isTweak,
-            isPackage: tweakItem.isPackage,
-            needsSigning: tweakItem.needsSigning
+            isDebImportedTweak: tweakItem.isDebImportedTweak
         )
         tweakItems.insert(newTweakItem, at: indexToRename)
 
@@ -577,51 +570,6 @@ struct LCTweakFolderView : View {
         }
     }
 
-    func signPackage(tweakItem: LCTweakItem) async {
-        let fm = FileManager()
-        guard fm.fileExists(atPath: tweakItem.fileUrl.path) else {
-            errorInfo = "lc.tweakView.packageNotFound %@".localizeWithFormat(tweakItem.fileUrl.lastPathComponent)
-            errorShow = true
-            return
-        }
-        guard LCSharedUtils.certificatePassword() != nil else {
-            errorInfo = "lc.tweakView.noCertificateError".loc
-            errorShow = true
-            return
-        }
-        do {
-            isTweakSigning = true
-            try await LCUtils.signTweaks(tweakFolderUrl: tweakItem.fileUrl, force: false) { _ in }
-            isTweakSigning = false
-
-            // update metadata
-            let metaURL = tweakItem.fileUrl.appendingPathComponent(".lc-package.json")
-            if let data = try? Data(contentsOf: metaURL),
-               var dict = try? JSONSerialization.jsonObject(with: data, options: []) as? [String:Any] {
-                dict["needsSigning"] = false
-                if let newData = try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys]) {
-                    try newData.write(to: metaURL, options: .atomic)
-                }
-            }
-
-            if let idx = tweakItems.firstIndex(where: { $0.fileUrl.path == tweakItem.fileUrl.path }) {
-                tweakItems[idx] = LCTweakItem(
-                    fileUrl: tweakItems[idx].fileUrl,
-                    isFolder: tweakItems[idx].isFolder,
-                    isFramework: tweakItems[idx].isFramework,
-                    isTweak: tweakItems[idx].isTweak,
-                    isPackage: tweakItems[idx].isPackage,
-                    needsSigning: false
-                )
-            }
-        } catch {
-            isTweakSigning = false
-            errorInfo = error.localizedDescription
-            errorShow = true
-            return
-        }
-    }
-    
     func createNewFolder() async {
         guard let newName = await renameFileInput.open(), newName != "" else {
             return
@@ -635,7 +583,7 @@ struct LCTweakFolderView : View {
             errorInfo = error.localizedDescription
             return
         }
-        tweakItems.append(LCTweakItem(fileUrl: dest, isFolder: true, isFramework: false, isTweak: false, isPackage: false, needsSigning: false))
+        tweakItems.append(LCTweakItem(fileUrl: dest, isFolder: true, isFramework: false, isTweak: false, isDebImportedTweak: false))
         if isRoot {
             tweakFolders.append(newName)
         }
@@ -690,7 +638,7 @@ struct LCTweakFolderView : View {
                         LCPatchAddRPath(path, header);
                     }
                 }
-                self.tweakItems.append(LCTweakItem(fileUrl: toPath, isFolder: isFramework, isFramework: isFramework, isTweak: isTweak, isPackage: false, needsSigning: false))
+                self.tweakItems.append(LCTweakItem(fileUrl: toPath, isFolder: isFramework, isFramework: isFramework, isTweak: isTweak, isDebImportedTweak: false))
             }
             if !installErrors.isEmpty {
                 throw installErrors.joined(separator: "\n")
@@ -793,12 +741,18 @@ struct LCTweakFolderView : View {
                 if fileName == "TweakInfo.plist" {
                     continue
                 }
+                // .lc_deb_redirects.plist and .lc_shared_jbroot are DebImporter's own
+                // bookkeeping for this folder, not something the user imported themselves.
+                if fileName.hasPrefix(".") {
+                    continue
+                }
                 let fileUrl = folderURL.appendingPathComponent(fileName)
                 var isDirectory: ObjCBool = false
                 fm.fileExists(atPath: fileUrl.path, isDirectory: &isDirectory)
                 let isFramework = isDirectory.boolValue && fileUrl.lastPathComponent.hasSuffix(".framework")
                 let isTweak = !isDirectory.boolValue && fileUrl.lastPathComponent.hasSuffix(".dylib")
-                items.append(LCTweakItem(fileUrl: fileUrl, isFolder: isDirectory.boolValue, isFramework: isFramework, isTweak: isTweak, isPackage: false, needsSigning: false))
+                let isDebImportedTweak = isDirectory.boolValue && fm.fileExists(atPath: fileUrl.appendingPathComponent(DebImporter.debTweakMarkerName).path)
+                items.append(LCTweakItem(fileUrl: fileUrl, isFolder: isDirectory.boolValue, isFramework: isFramework, isTweak: isTweak, isDebImportedTweak: isDebImportedTweak))
             }
         } catch {
             NSLog("[LC] failed to load tweaks \(error.localizedDescription)")
@@ -1023,336 +977,26 @@ struct LCTweakFolderView : View {
         }
     }
 
-    // Extracts a .deb into a named package folder (<packageID>_<version>), records
-    // control-file metadata (package ID, version, architecture, depends) and a
-    // needsSigning flag in .lc-package.json, links associated .bundle resources, and
-    // attempts to sign immediately if a certificate is available. This is the entry
-    // point TweakLoader.m's package-metadata-aware loader (loadTweaksUsingPackageMetadata)
-    // expects, so .deb installs from here are recognized natively as packages.
+    // Extracts a .deb via DebImporter (ar -> control.tar/data.tar -> mirrored payload,
+    // with a bounded mv/cp/mkdir/ln-s subset of pre/postinst applied, no arbitrary script
+    // execution). See DebImporter.swift for the full extraction/redirect/jbroot pipeline;
+    // this just wires it into the folder-browser UI and surfaces any postinst/preinst
+    // lines it couldn't safely apply.
     private func installDebPackage(from fileUrl: URL, fm: FileManager) async throws {
-        let extractionRoot = fm.temporaryDirectory.appendingPathComponent("lc-deb-\(UUID().uuidString)", isDirectory: true)
-        let debExtractDir = extractionRoot.appendingPathComponent("deb", isDirectory: true)
-        let controlExtractDir = extractionRoot.appendingPathComponent("control", isDirectory: true)
-        defer {
-            try? fm.removeItem(at: extractionRoot)
+        let result: DebImportResult
+        do {
+            result = try DebImporter.importDeb(at: fileUrl, into: baseUrl)
+        } catch {
+            throw error.localizedDescription
         }
-
-        try fm.createDirectory(at: extractionRoot, withIntermediateDirectories: true)
-        try fm.createDirectory(at: debExtractDir, withIntermediateDirectories: true)
-
-        let debDestination = extractionRoot.appendingPathComponent(fileUrl.lastPathComponent)
-        if fm.fileExists(atPath: debDestination.path) {
-            try fm.removeItem(at: debDestination)
+        if !result.unsupportedScriptLines.isEmpty {
+            unsupportedScriptLines = result.unsupportedScriptLines
+            showUnsupportedScriptWarning = true
         }
-        try fm.moveItem(at: fileUrl, to: debDestination)
-
-        guard extract(debDestination.path, debExtractDir.path, Progress()) == 0 else {
-            throw "Failed to extract \(fileUrl.lastPathComponent)"
+        reloadTweakItems()
+        if isRoot {
+            syncRootTweakFoldersIfNeeded()
         }
-
-        guard let dataTarURL = findArchivePart(in: debExtractDir, prefix: "data.tar") else {
-            throw "Invalid deb package: missing data.tar payload in \(fileUrl.lastPathComponent)"
-        }
-
-        let controlInfo = try loadControlInfo(from: debExtractDir, controlExtractDir: controlExtractDir, fileName: fileUrl.lastPathComponent, fm: fm)
-        let packageFolderName = uniquePackageFolderName(baseName: "\(controlInfo.packageID)_\(controlInfo.version)", in: baseUrl, fm: fm)
-        let packageFolder = baseUrl.appendingPathComponent(packageFolderName, isDirectory: true)
-        try fm.createDirectory(at: packageFolder, withIntermediateDirectories: false)
-
-        guard extract(dataTarURL.path, packageFolder.path, Progress()) == 0 else {
-            try? fm.removeItem(at: packageFolder)
-            throw "Failed to extract data payload from \(fileUrl.lastPathComponent)"
-        }
-
-        let loadableArtifacts = discoverLoadableArtifacts(in: packageFolder, fm: fm)
-        linkAssociatedBundleResources(in: packageFolder, loadableArtifacts: loadableArtifacts, fm: fm)
-        for relPath in loadableArtifacts {
-            if relPath.hasSuffix(".framework") {
-                let bundleURL = packageFolder.appendingPathComponent(relPath)
-                if let executableURL = Bundle(url: bundleURL)?.executableURL {
-                    patchRPathIfNeeded(binaryURL: executableURL)
-                }
-            } else {
-                patchRPathIfNeeded(binaryURL: packageFolder.appendingPathComponent(relPath))
-            }
-        }
-
-        var signingSucceeded = false
-        if LCSharedUtils.certificatePassword() != nil {
-            do {
-                try await LCUtils.signTweaks(tweakFolderUrl: packageFolder, force: false) { _ in }
-                signingSucceeded = true
-            } catch {
-                NSLog("[LC] Signing package %@ failed: %@", fileUrl.lastPathComponent, error.localizedDescription)
-            }
-        }
-        let needsSigningFlag = (LCSharedUtils.certificatePassword() == nil) || !signingSucceeded
-        let metadata = LCPackageMetadata(
-            packageID: controlInfo.packageID,
-            version: controlInfo.version,
-            architecture: controlInfo.architecture,
-            name: controlInfo.name,
-            depends: controlInfo.depends,
-            sourceFilename: fileUrl.lastPathComponent,
-            importedAt: ISO8601DateFormatter().string(from: Date()),
-            loadableArtifacts: loadableArtifacts,
-            routesDetected: Array(Set(loadableArtifacts.map(routeForArtifactPath))).sorted(),
-            needsSigning: needsSigningFlag
-        )
-        try writePackageMetadata(metadata, to: packageFolder)
-        updateTweakItem(for: packageFolder)
-    }
-
-    private func loadControlInfo(from debExtractDir: URL, controlExtractDir: URL, fileName: String, fm: FileManager) throws -> LCControlInfo {
-        guard let controlTarURL = findArchivePart(in: debExtractDir, prefix: "control.tar") else {
-            let fallbackID = sanitizePackageName((fileName as NSString).deletingPathExtension)
-            return LCControlInfo(packageID: fallbackID, version: "0", architecture: nil, name: nil, depends: nil)
-        }
-        try fm.createDirectory(at: controlExtractDir, withIntermediateDirectories: true)
-        guard extract(controlTarURL.path, controlExtractDir.path, Progress()) == 0 else {
-            throw "Failed to extract control metadata from \(fileName)"
-        }
-
-        guard let controlFile = findControlFile(in: controlExtractDir, fm: fm),
-              let text = try? String(contentsOf: controlFile, encoding: .utf8) else {
-            let fallbackID = sanitizePackageName((fileName as NSString).deletingPathExtension)
-            return LCControlInfo(packageID: fallbackID, version: "0", architecture: nil, name: nil, depends: nil)
-        }
-
-        let fields = parseDebControlFields(text)
-        let packageID = sanitizePackageName(fields["Package"] ?? (fileName as NSString).deletingPathExtension)
-        let version = sanitizePackageName(fields["Version"] ?? "0")
-        return LCControlInfo(
-            packageID: packageID.isEmpty ? "unknown-package" : packageID,
-            version: version.isEmpty ? "0" : version,
-            architecture: fields["Architecture"],
-            name: fields["Name"],
-            depends: fields["Depends"]
-        )
-    }
-
-    private func discoverLoadableArtifacts(in packageFolder: URL, fm: FileManager) -> [String] {
-        guard let enumerator = fm.enumerator(at: packageFolder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
-            return []
-        }
-        let basePath = packageFolder.standardizedFileURL.path
-        var artifacts: Set<String> = []
-        while let item = enumerator.nextObject() as? URL {
-            let itemPath = item.standardizedFileURL.path
-            guard itemPath.hasPrefix(basePath + "/") else {
-                continue
-            }
-            let relPath = String(itemPath.dropFirst(basePath.count + 1))
-            var isDirectory = ObjCBool(false)
-            fm.fileExists(atPath: item.path, isDirectory: &isDirectory)
-            if isDirectory.boolValue {
-                if item.lastPathComponent.hasSuffix(".framework") {
-                    let rel = String(itemPath.dropFirst(basePath.count + 1))
-                    artifacts.insert(rel)
-                    enumerator.skipDescendants()
-                }
-                continue
-            }
-            guard relPath.hasSuffix(".dylib"), shouldTreatAsLoadableDylib(binaryURL: item, relativePath: relPath, packageFolder: packageFolder) else {
-                continue
-            }
-            artifacts.insert(relPath)
-        }
-        return Array(artifacts).sorted()
-    }
-
-    private func shouldTreatAsLoadableDylib(binaryURL: URL, relativePath: String, packageFolder: URL) -> Bool {
-        let parentPath = binaryURL.deletingLastPathComponent()
-        let base = binaryURL.deletingPathExtension().lastPathComponent
-        let filterURL = parentPath.appendingPathComponent("\(base).plist")
-        if FileManager.default.fileExists(atPath: filterURL.path) {
-            return true
-        }
-        if relativePath.contains("/DynamicLibraries/") || relativePath.hasPrefix("DynamicLibraries/") {
-            return true
-        }
-        if relativePath.contains("/Applications/"), relativePath.contains(".app/Frameworks/") {
-            return true
-        }
-        return parentPath.path == packageFolder.path
-    }
-
-    private func routeForArtifactPath(_ relPath: String) -> String {
-        if relPath.contains("/DynamicLibraries/") || relPath.hasPrefix("DynamicLibraries/") {
-            return "mobile-substrate-package"
-        }
-        if relPath.contains("/Applications/"), relPath.contains(".app/Frameworks/") {
-            return "prebundled-app-package"
-        }
-        return "standalone-binary"
-    }
-
-    private func linkAssociatedBundleResources(in packageFolder: URL, loadableArtifacts: [String], fm: FileManager) {
-        guard let enumerator = fm.enumerator(at: packageFolder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
-            return
-        }
-        var bundleDirs: [URL] = []
-        while let item = enumerator.nextObject() as? URL {
-            var isDirectory = ObjCBool(false)
-            fm.fileExists(atPath: item.path, isDirectory: &isDirectory)
-            if !isDirectory.boolValue {
-                continue
-            }
-            if item.lastPathComponent.hasSuffix(".bundle") {
-                bundleDirs.append(item)
-                enumerator.skipDescendants()
-            }
-        }
-        guard !bundleDirs.isEmpty else {
-            return
-        }
-
-        var dylibParentDirs: Set<String> = []
-        for relPath in loadableArtifacts where relPath.hasSuffix(".dylib") {
-            let parent = (relPath as NSString).deletingLastPathComponent
-            dylibParentDirs.insert(parent.isEmpty ? "." : parent)
-        }
-
-        let appSupportSource = packageFolder.appendingPathComponent("Library/Application Support", isDirectory: true)
-        let hasAppSupportSource = fm.fileExists(atPath: appSupportSource.path)
-
-        for dirRel in dylibParentDirs {
-            let targetDir = dirRel == "." ? packageFolder : packageFolder.appendingPathComponent(dirRel, isDirectory: true)
-            for bundleDir in bundleDirs {
-                if bundleDir.deletingLastPathComponent().path == targetDir.path {
-                    continue
-                }
-                let linkURL = targetDir.appendingPathComponent(bundleDir.lastPathComponent)
-                if fm.fileExists(atPath: linkURL.path) {
-                    continue
-                }
-                do {
-                    try fm.createSymbolicLink(at: linkURL, withDestinationURL: bundleDir)
-                } catch {
-                    NSLog("[LC] Failed to link bundle %@ -> %@: %@", linkURL.path, bundleDir.path, error.localizedDescription)
-                }
-            }
-
-            if hasAppSupportSource {
-                let libraryDir = targetDir.appendingPathComponent("Library", isDirectory: true)
-                let appSupportLink = libraryDir.appendingPathComponent("Application Support", isDirectory: true)
-                do {
-                    if !fm.fileExists(atPath: libraryDir.path) {
-                        try fm.createDirectory(at: libraryDir, withIntermediateDirectories: true)
-                    }
-                    if !fm.fileExists(atPath: appSupportLink.path) {
-                        try fm.createSymbolicLink(at: appSupportLink, withDestinationURL: appSupportSource)
-                    }
-                } catch {
-                    NSLog("[LC] Failed to link Application Support for %@: %@", targetDir.path, error.localizedDescription)
-                }
-            }
-        }
-    }
-
-    private func writePackageMetadata(_ metadata: LCPackageMetadata, to packageFolder: URL) throws {
-        let metadataURL = packageFolder.appendingPathComponent(".lc-package.json")
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        let data = try encoder.encode(metadata)
-        try data.write(to: metadataURL, options: .atomic)
-    }
-
-    private func patchRPathIfNeeded(binaryURL: URL) {
-        LCParseMachO((binaryURL.path as NSString).utf8String, false) { path, header, _, _ in
-            LCPatchAddRPath(path, header)
-        }
-    }
-
-    private func updateTweakItem(for path: URL) {
-        let fm = FileManager.default
-        var isFolder = ObjCBool(false)
-        fm.fileExists(atPath: path.path, isDirectory: &isFolder)
-        let fileName = path.lastPathComponent
-        var isPackage = false
-        var needsSigning = false
-        if isFolder.boolValue {
-            let metaURL = path.appendingPathComponent(".lc-package.json")
-            if fm.fileExists(atPath: metaURL.path) {
-                isPackage = true
-                if let data = try? Data(contentsOf: metaURL),
-                   let dict = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-                   let signingNeeded = dict["needsSigning"] as? Bool {
-                    needsSigning = signingNeeded
-                }
-            }
-        }
-        let item = LCTweakItem(
-            fileUrl: path,
-            isFolder: isFolder.boolValue,
-            isFramework: isFolder.boolValue && fileName.hasSuffix(".framework"),
-            isTweak: !isFolder.boolValue && fileName.hasSuffix(".dylib"),
-            isPackage: isPackage,
-            needsSigning: needsSigning
-        )
-        if let idx = tweakItems.firstIndex(where: { $0.fileUrl.path == path.path }) {
-            tweakItems[idx] = item
-        } else {
-            tweakItems.append(item)
-        }
-    }
-
-    private func findArchivePart(in folder: URL, prefix: String) -> URL? {
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
-            return nil
-        }
-        return files.first(where: { $0.lastPathComponent.hasPrefix(prefix) })
-    }
-
-    private func findControlFile(in folder: URL, fm: FileManager) -> URL? {
-        guard let enumerator = fm.enumerator(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
-            return nil
-        }
-        while let item = enumerator.nextObject() as? URL {
-            var isDirectory = ObjCBool(false)
-            fm.fileExists(atPath: item.path, isDirectory: &isDirectory)
-            if !isDirectory.boolValue && item.lastPathComponent == "control" {
-                return item
-            }
-        }
-        return nil
-    }
-
-    private func parseDebControlFields(_ text: String) -> [String: String] {
-        var parsed: [String: String] = [:]
-        var currentKey: String?
-        for line in text.split(whereSeparator: \.isNewline) {
-            let str = String(line)
-            if str.hasPrefix(" "), let currentKey {
-                parsed[currentKey, default: ""] += "\n" + str.trimmingCharacters(in: .whitespaces)
-                continue
-            }
-            guard let idx = str.firstIndex(of: ":") else {
-                continue
-            }
-            let key = String(str[..<idx]).trimmingCharacters(in: .whitespaces)
-            let value = String(str[str.index(after: idx)...]).trimmingCharacters(in: .whitespaces)
-            parsed[key] = value
-            currentKey = key
-        }
-        return parsed
-    }
-
-    private func sanitizePackageName(_ value: String) -> String {
-        let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
-        let scalars = value.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" }
-        return String(scalars)
-    }
-
-    private func uniquePackageFolderName(baseName: String, in root: URL, fm: FileManager) -> String {
-        var candidate = baseName
-        var index = 1
-        while fm.fileExists(atPath: root.appendingPathComponent(candidate).path) {
-            candidate = "\(baseName)-\(index)"
-            index += 1
-        }
-        return candidate
     }
 }
 
