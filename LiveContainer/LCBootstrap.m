@@ -820,8 +820,11 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     if(!isSideStore) {
         SecItemGuestHooksInit();
         NSFMGuestHooksInit();
-        initDead10ccFix();
     }
+    // background-suspend lock fix should always run: it only protects against
+    // RunningBoard killing the guest for held file locks, independent of the
+    // SideStore launch path
+    initDead10ccFix();
     if(isLiveProcess) {
         NSURLSCGuestHooksInit();
     }
