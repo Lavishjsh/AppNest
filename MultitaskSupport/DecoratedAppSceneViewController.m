@@ -28,6 +28,7 @@
 @property(nonatomic) BOOL lastConstraintBottomBar;
 @property(nonatomic) BOOL lastConstraintHideBar;
 @property(nonatomic) BOOL hasBuiltConstraints;
+@property(nonatomic) BOOL isAppTerminated;
 @property(nonatomic) NSLayoutConstraint *navigationBarEdgeConstraint;
 @property(nonatomic) UIBarButtonItem *titleBarButtonItem;
 @property(nonatomic, copy) UIMenu *(^titleMenuProviderBlock)(NSArray<UIMenuElement *> *);
@@ -503,6 +504,10 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
         label.text = NSLocalizedString(@"lc.multitaskAppWindow.appTerminated", @"");
         label.textAlignment = NSTextAlignmentCenter;
         [self.view insertSubview:label atIndex:0];
+        // the window bar is hidden while a maximized app runs with the dock collapsed,
+        // bring it back so the terminated window can still be moved and closed
+        _isAppTerminated = YES;
+        [self updateVerticalConstraints];
     }
 }
 //⭐️⭐️⭐️Force Landscape Mode + multitask mode
@@ -794,7 +799,7 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
     BOOL bottomWindowBar = (toolbarMode == 1);
     BOOL overlayEnabled = [NSUserDefaults.lcSharedDefaults boolForKey:@"LCMultitaskOverlayMode"];
     BOOL overlayMode = overlayEnabled && self.isMaximized && toolbarMode != 2;
-    BOOL forceHideInMaximized = (MultitaskDockManager.shared.isCollapsed && _isMaximized);
+    BOOL forceHideInMaximized = (MultitaskDockManager.shared.isCollapsed && _isMaximized && !_isAppTerminated);
     BOOL hideWindowBar = (toolbarMode == 2) || (!overlayMode && forceHideInMaximized);
     BOOL wasOverlay = self.navBarIsOverlay;
 
@@ -821,11 +826,18 @@ static UIInterfaceOrientation LCCurrentInterfaceOrientation(void) {
 
         // Update safe area insets
         if(self.isMaximized) {
-            self.appSceneVC.shouldSkipDebounceOnce = YES;
-            __weak typeof(self) weakSelf = self;
-            [self.appSceneVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
-                [weakSelf updateMaximizedFrameWithSettings:settings];
-            }];
+            if(self.isAppTerminated) {
+                // the guest scene is already torn down by the time appSceneVCAppDidExit: runs, so
+                // -[AppSceneViewController updateSettingsWithBlock:] may drop the block and our frame
+                // would stay in the bar-less fullscreen geometry, putting the bar under the status bar
+                [self updateMaximizedFrameWithSettings:[UIMutableApplicationSceneSettings new]];
+            } else {
+                self.appSceneVC.shouldSkipDebounceOnce = YES;
+                __weak typeof(self) weakSelf = self;
+                [self.appSceneVC updateSettingsWithBlock:^(UIMutableApplicationSceneSettings *settings) {
+                    [weakSelf updateMaximizedFrameWithSettings:settings];
+                }];
+            }
         }
 
         self.hasBuiltConstraints = YES;
