@@ -22,6 +22,7 @@
 @property(nonatomic) BOOL methodInited;
 @property(nonatomic) int deboundeToken;
 - (void)handleAppDidEnterBackground:(NSNotification *)notification;
+- (void)handleAppDidEnterBackgroundReal;
 - (void)_handleTaskCompletionAndTerminate:(id)arg1;
 @end
 @interface UIApplication : NSObject
@@ -32,15 +33,27 @@
 
 Dead10ccFix* fix = nil;
 
+static dispatch_source_t dead10ccPollTimer = nil;
+
 void initDead10ccFix(void) {
+    fix = [[Dead10ccFix alloc] init];
 
     if(NSUserDefaults.isLiveProcess) {
-        fix = [[Dead10ccFix alloc] init];
+        NSLog(@"[LC] Dead10ccFix: registering via LiveProcess (NSExtensionHostDidEnterBackgroundNotification)");
         [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidEnterBackground:) name:NSExtensionHostDidEnterBackgroundNotification object:nil];
     } else if (NSUserDefaults.isSharedApp){
-        fix = [[Dead10ccFix alloc] init];
+        NSLog(@"[LC] Dead10ccFix: registering via shared app (UIApplicationDidEnterBackgroundNotification)");
+        [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidEnterBackground:) name:@"UIApplicationDidEnterBackgroundNotification" object:nil];
+    } else {
+        NSLog(@"[LC] Dead10ccFix: registering via private container fallback (UIApplicationDidEnterBackgroundNotification)");
         [NSNotificationCenter.defaultCenter addObserver:fix selector:@selector(handleAppDidEnterBackground:) name:@"UIApplicationDidEnterBackgroundNotification" object:nil];
     }
+    dead10ccPollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0));
+    dispatch_source_set_timer(dead10ccPollTimer, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC), 3 * NSEC_PER_SEC, 1 * NSEC_PER_SEC);
+    dispatch_source_set_event_handler(dead10ccPollTimer, ^{
+        [fix handleAppDidEnterBackgroundReal];
+    });
+    dispatch_resume(dead10ccPollTimer);
 }
 
 
@@ -49,11 +62,16 @@ void initDead10ccFix(void) {
 @implementation Dead10ccFix
 
 - (void)handleAppDidEnterBackgroundReal {
-    NSSet* locks = [self _lock_lockedFilePathsIgnoring:[NSMutableSet set]];
+    if(locks.count > 0) {
+        NSLog(@"[LC] Dead10ccFix: found %lu locked file(s) to exempt from suspend-kill: %@", (unsigned long)locks.count, locks);
+    }
     for(NSString* path in locks) {
         unsigned char value = 0x01;
 
-        setxattr([path UTF8String], "com.apple.runningboard.can-suspend-locked", &value, sizeof(value),0,0);
+        int result = setxattr([path UTF8String], "com.apple.runningboard.can-suspend-locked", &value, sizeof(value),0,0);
+        if(result != 0) {
+            NSLog(@"[LC] Dead10ccFix: setxattr failed for %@: %s", path, strerror(errno));
+        }
     }
 }
 
@@ -123,12 +141,17 @@ void initDead10ccFix(void) {
             continue;
         }
 
+        BOOL isIgnored = NO;
         for (NSString *ignoringPath in ignoring) {
             if ([path hasPrefix:ignoringPath]) {
                 // _rbs_process_log with %{public}@: Ignoring file %{public}@ because it is in an allowed path:  %{public}@
 //                NSLog(@"Ignoring file %@ because it is in an allowed path: %@", path, ignoringPath);
-                continue;
+                isIgnored = YES;
+                break;
             }
+        }
+        if (isIgnored) {
+            continue;
         }
 
         if ([path hasSuffix:@"-shm"] || [path hasSuffix:@"-wal"] || [path hasSuffix:@"-journal"]) {
@@ -147,7 +170,7 @@ void initDead10ccFix(void) {
             }
         }
         int (*_sqlite3_lockstate)(char*, int) = dlsym(RTLD_DEFAULT, "_sqlite3_lockstate");
-        int sqlite_lock = _sqlite3_lockstate(path_c, pid);
+        int sqlite_lock = _sqlite3_lockstate ? _sqlite3_lockstate(path_c, pid) : -1;
         if (sqlite_lock == 0) {
             // _rbs_process_log with %{public}@ Ignoring unlocked SQLite database: %{public}@
 //            NSLog(@"Ignoring unlocked SQLite database: %@", path);

@@ -7,6 +7,7 @@
 #import "../LiveContainer/utils.h"
 #include "../LiveContainer/LCDebugLog.h"
 #include "../litehook/src/litehook.h"
+#import "DebPathRedirect.h"
 
 static NSString *const kDisabledTweaksKey = @"disabledItems";
 static NSString *const kContainerInfoFileName = @"LCContainerInfo.plist";
@@ -158,8 +159,6 @@ static BOOL isTweakURLDisabled(NSURL *url, NSURL *rootFolderURL) {
     return NO;
 }
 
-static NSString * const kLCPackageMetadataFileName = @".lc-package.json";
-
 static NSString *gContainerTweakPath = nil;
 static NSString *gGlobalTweakPath = nil;
 static NSString *gTweakFolderName = nil;
@@ -185,21 +184,6 @@ static BOOL stringMatchesPattern(NSString *value, NSString *pattern) {
         return [value hasPrefix:prefix];
     }
     return [value isEqualToString:pattern];
-}
-
-static BOOL isSafeArtifactRelativePath(NSString *relativePath) {
-    if (![relativePath isKindOfClass:NSString.class] || relativePath.length == 0) {
-        return NO;
-    }
-    if ([relativePath hasPrefix:@"/"]) {
-        return NO;
-    }
-    for (NSString *component in [relativePath pathComponents]) {
-        if ([component isEqualToString:@".."]) {
-            return NO;
-        }
-    }
-    return YES;
 }
 
 static BOOL processMatchesSubstrateFilter(NSURL *dylibURL) {
@@ -317,49 +301,14 @@ static NSString *loadTweakAtURL(NSURL *url, NSString *sourceContext) {
     }
 }
 
-static BOOL loadTweaksUsingPackageMetadata(NSURL *folderURL, NSMutableArray *errors) {
-    NSURL *metadataURL = [folderURL URLByAppendingPathComponent:kLCPackageMetadataFileName];
-    NSData *metadataData = [NSData dataWithContentsOfURL:metadataURL];
-    if (!metadataData) {
-        return NO;
-    }
-    NSError *error = nil;
-    NSDictionary *metadata = [NSJSONSerialization JSONObjectWithData:metadataData options:0 error:&error];
-    if (error || ![metadata isKindOfClass:NSDictionary.class]) {
-        [errors addObject:[NSString stringWithFormat:@"[%@] Invalid package metadata", folderURL.lastPathComponent]];
-        return YES;
-    }
-    NSArray *artifacts = metadata[@"loadableArtifacts"];
-    if (![artifacts isKindOfClass:NSArray.class]) {
-        [errors addObject:[NSString stringWithFormat:@"[%@] Missing loadableArtifacts in package metadata", folderURL.lastPathComponent]];
-        return YES;
-    }
-    for (id relativePath in artifacts) {
-        if (![relativePath isKindOfClass:NSString.class]) {
-            continue;
-        }
-        if (!isSafeArtifactRelativePath(relativePath)) {
-            [errors addObject:[NSString stringWithFormat:@"[%@] Unsafe artifact path %@", folderURL.lastPathComponent, relativePath]];
-            continue;
-        }
-        NSURL *artifactURL = [folderURL URLByAppendingPathComponent:relativePath];
-        if (![NSFileManager.defaultManager fileExistsAtPath:artifactURL.path]) {
-            [errors addObject:[NSString stringWithFormat:@"[%@] Missing artifact %@", folderURL.lastPathComponent, relativePath]];
-            continue;
-        }
-        NSString *loadError = loadTweakAtURL(artifactURL, folderURL.lastPathComponent);
-        if (loadError) {
-            [errors addObject:loadError];
-        }
-    }
-    return YES;
-}
-
 static void loadTweaksRecursively(NSURL *folderURL, NSURL *rootFolderURL, NSMutableArray *errors) {
-    if (loadTweaksUsingPackageMetadata(folderURL, errors)) {
-        return;
-    }
-    NSArray<NSURL *> *items = [NSFileManager.defaultManager contentsOfDirectoryAtURL:folderURL includingPropertiesForKeys:@[NSURLIsDirectoryKey] options:0 error:nil];
+    // Skip dotfiles -- in particular ".jbroot" (the symlink DebImporter.swift places next
+    // to every deb-imported dylib/framework pointing at the shared ".lc_shared_jbroot"
+    // mirror) and ".lc_shared_jbroot" itself. Since NSURLIsDirectoryKey follows symlinks, a
+    // symlink-to-directory reports YES there, so without this we'd recurse into
+    // .lc_shared_jbroot and re-dlopen every mirrored framework from every other
+    // currently-imported tweak a second time through it.
+    NSArray<NSURL *> *items = [NSFileManager.defaultManager contentsOfDirectoryAtURL:folderURL includingPropertiesForKeys:@[NSURLIsDirectoryKey] options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
     for (NSURL *fileURL in items) {
         NSString *name = fileURL.lastPathComponent;
         if ([name hasSuffix:@".disabled"]) {
@@ -565,12 +514,6 @@ static NSString* redirectTweakResourcePath(NSString *originalPath) {
     return [self hook_enumeratorAtPath:redirected];
 }
 
-- (BOOL)hook_createDirectoryAtPath:(NSString*)path withIntermediateDirectories:(BOOL)createIntermediates attributes:(NSDictionary<NSString*,id>*)attributes error:(NSError**)error {
-    // For creation, we might want to allow creating in the original path
-    // But we should also check if the redirected path exists
-    return [self hook_createDirectoryAtPath:path withIntermediateDirectories:createIntermediates attributes:attributes error:error];
-}
-
 - (BOOL)hook_removeItemAtPath:(NSString*)path error:(NSError**)error {
     NSString *redirected = redirectTweakResourcePath(path);
     // Try redirected path first, then original
@@ -598,7 +541,6 @@ static void installPathRedirectionHooks(void) {
     swizzle(NSFileManager.class, @selector(attributesOfItemAtPath:error:), @selector(hook_attributesOfItemAtPath:error:));
     swizzle(NSFileManager.class, @selector(contentsOfDirectoryAtPath:error:), @selector(hook_contentsOfDirectoryAtPath:error:));
     swizzle(NSFileManager.class, @selector(enumeratorAtPath:), @selector(hook_enumeratorAtPath:));
-    swizzle(NSFileManager.class, @selector(createDirectoryAtPath:withIntermediateDirectories:attributes:error:), @selector(hook_createDirectoryAtPath:withIntermediateDirectories:attributes:error:));
     swizzle(NSFileManager.class, @selector(removeItemAtPath:error:), @selector(hook_removeItemAtPath:error:));
     
     NSLog(@"[TweakLoader] Path redirection hooks installed");
@@ -786,6 +728,12 @@ static void TweakLoaderConstructor() {
         // nothing to load
         return;
     }
+
+    // Rewrite the absolute paths deb-imported tweaks use to find their own bundles/frameworks
+    // (e.g. /Library/Application Support/Foo.bundle) to wherever DebImporter actually put them,
+    // before any tweak dylib is dlopen'd and can go looking for them.
+    NSString *selectedTweakFolderPath = tweakFolderName.length > 0 ? (gContainerTweakPath ?: [globalTweakFolder stringByAppendingPathComponent:tweakFolderName]) : nil;
+    DebPathRedirectInit(globalTweakFolder, selectedTweakFolderPath);
 
     // Load CydiaSubstrate
     const char *lcMainBundlePath;
