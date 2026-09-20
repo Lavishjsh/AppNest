@@ -62,6 +62,7 @@ void initDead10ccFix(void) {
 @implementation Dead10ccFix
 
 - (void)handleAppDidEnterBackgroundReal {
+    NSMutableSet *locks = [self _lock_lockedFilePathsIgnoring:[NSMutableSet set]];
     if(locks.count > 0) {
         NSLog(@"[LC] Dead10ccFix: found %lu locked file(s) to exempt from suspend-kill: %@", (unsigned long)locks.count, locks);
     }
