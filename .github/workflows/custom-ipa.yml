@@ -1,0 +1,118 @@
+name: Prepare Custom LiveContainer IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: Direct HTTPS download URL for a LiveContainer IPA
+        required: true
+        type: string
+      artifact_name:
+        description: Name shown under this run's Artifacts
+        required: false
+        default: custom-livecontainer-ipa
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Validate and upload IPA
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate inputs
+        id: inputs
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+          ARTIFACT_NAME: ${{ inputs.artifact_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+          from urllib.parse import urlparse
+
+          parsed = urlparse(os.environ["IPA_URL"])
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+              sys.exit("Provide a direct HTTPS URL without embedded credentials.")
+
+          artifact_name = os.environ["ARTIFACT_NAME"] or "custom-livecontainer-ipa"
+          if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", artifact_name):
+              sys.exit("Artifact name must be 1-64 characters: letters, numbers, dot, underscore, or hyphen.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"artifact_name={artifact_name}\n")
+          PY
+
+      - name: Download and inspect IPA
+        id: ipa
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+        run: |
+          set -euo pipefail
+          ipa_path="$RUNNER_TEMP/custom-livecontainer.ipa"
+          curl --fail --location --silent --show-error --retry 3 --retry-delay 2 \
+            --connect-timeout 30 --max-time 900 "$IPA_URL" --output "$ipa_path"
+
+          python3 - "$ipa_path" <<'PY'
+          import os
+          import plistlib
+          import re
+          import sys
+          import zipfile
+
+          ipa_path = sys.argv[1]
+          try:
+              with zipfile.ZipFile(ipa_path) as ipa:
+                  bad_entry = ipa.testzip()
+                  if bad_entry:
+                      sys.exit(f"IPA archive has a corrupt entry: {bad_entry}")
+
+                  info_paths = [
+                      name for name in ipa.namelist()
+                      if re.fullmatch(r"Payload/[^/]+\.app/Info\.plist", name)
+                  ]
+                  if len(info_paths) != 1:
+                      sys.exit("Expected exactly one app bundle Info.plist in Payload/.")
+
+                  info = plistlib.loads(ipa.read(info_paths[0]))
+          except (OSError, zipfile.BadZipFile, plistlib.InvalidFileException) as error:
+              sys.exit(f"Could not read a valid IPA: {error}")
+
+          bundle_id = info.get("CFBundleIdentifier", "")
+          if not isinstance(bundle_id, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", bundle_id):
+              sys.exit("IPA has a missing or invalid bundle identifier.")
+
+          schemes = [
+              scheme
+              for url_type in info.get("CFBundleURLTypes", [])
+              for scheme in url_type.get("CFBundleURLSchemes", [])
+              if isinstance(scheme, str)
+          ]
+          is_livecontainer = (
+              bundle_id == "com.kdt.livecontainer"
+              or bundle_id.startswith("com.kdt.livecontainer.")
+              or any(scheme.lower() == "livecontainer" for scheme in schemes)
+          )
+          if not is_livecontainer:
+              sys.exit(f"IPA does not appear to be LiveContainer (bundle ID: {bundle_id or 'missing'}).")
+
+          version = str(info.get("CFBundleShortVersionString", "Unknown"))
+          version = re.sub(r"[^A-Za-z0-9._+-]", "_", version)[:64] or "Unknown"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"path={ipa_path}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write("## Custom LiveContainer IPA ready\n")
+              summary.write(f"- Bundle ID: `{bundle_id}`\n")
+              summary.write(f"- Version: `{version}`\n")
+              summary.write("- The IPA is uploaded unchanged. Import it into AppNest and select whether to enable AppNest tweaks.\n")
+          PY
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.inputs.outputs.artifact_name }}
+          path: ${{ steps.ipa.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
